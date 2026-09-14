@@ -5,6 +5,8 @@ import path from "node:path";
 import { resolveCli } from "@/lib/clis";
 import { careerOpsRoot, readMemory } from "@/lib/career-ops";
 import { assembleDedupContext } from "@/lib/core/discover";
+import { readAiKeys } from "@/lib/ai-key-store.mjs";
+import { streamChatWithFallback } from "@/lib/ai-client.mjs";
 
 // AI search orchestrates modes/discover.md by running the USER'S configured CLI
 // headless (CLI-agnostic, like the assistant). Web hunting is slow → generous
@@ -130,8 +132,88 @@ Follow modes/discover.md exactly. You are running headless for the web:
 - DEDUP: skip anything already known below; don't re-propose the user's existing companies.
 `;
 
+type AiKeyCfg = { provider: string; model: string; apiKey: string; baseUrl: string };
+
+/** Canonical discover prompt for BOTH engines — one source of truth. */
+function buildDiscoverPrompt(query: string): { prompt?: string; missing?: Response } {
+  let mode: string;
+  try {
+    // Read the CANONICAL mode at request time — never a homegrown prompt.
+    // Missing (older core) → graceful 400 so the Scan tab stays usable.
+    mode = fs.readFileSync(path.join(careerOpsRoot(), "modes", "discover.md"), "utf8");
+  } catch {
+    return {
+      missing: Response.json(
+        { code: "MODE_MISSING", error: "AI search needs a newer career-ops — update to enable it." },
+        { status: 400 },
+      ),
+    };
+  }
+  const { lines } = assembleDedupContext();
+  const memory = readMemory();
+  const memoryLine = memory.trim()
+    ? `\n\nWHAT YOU KNOW ABOUT THE USER (persistent memory):\n${memory.trim()}`
+    : "";
+  const knownBlock = lines.length
+    ? `\n\n--- ALREADY KNOWN (dedup — do NOT propose these) ---\n${lines.join("\n")}`
+    : "";
+  return { prompt: `${mode}${OUTPUT_CONTRACT}${memoryLine}${knownBlock}\n\n--- USER INTENT ---\n${query}\n` };
+}
+
+/** Stream a key-provider completion into the same text response the UI parses. */
+function keyEngineResponse(prompt: string, cfg: AiKeyCfg, signal: AbortSignal | null): Response {
+  const encoder = new TextEncoder();
+  let closed = false;
+  const stream = new ReadableStream<Uint8Array>({
+    async start(controller) {
+      const safeEnqueue = (s: string) => {
+        if (closed) return;
+        try {
+          controller.enqueue(encoder.encode(s));
+        } catch {
+          closed = true;
+        }
+      };
+      try {
+        for await (const delta of streamChatWithFallback({
+          provider: cfg.provider,
+          model: cfg.model,
+          apiKey: cfg.apiKey,
+          baseUrl: cfg.baseUrl,
+          prompt,
+          signal: signal ?? undefined,
+          onSwitch: (m: string, e: unknown, kind: string) => {
+            // Narrate hops into the same trace the UI renders for CLI runs.
+            const status = (e as { status?: number } | null)?.status;
+            safeEnqueue(
+              kind === "pulled"
+                ? `\n[auto-pull: fetching model '${m}' on your local server, retrying…]\n`
+                : `\n[auto-switch: ${m} failed (${status ?? "network"}) — trying next free model…]\n`,
+            );
+          },
+        })) {
+          safeEnqueue(delta);
+        }
+      } catch (e) {
+        // Same shape the CLI path reports transport failures in — the client's
+        // envelope parser surfaces bracketed lines as trace, never as offers.
+        safeEnqueue(`\n[AI key error: ${e instanceof Error ? e.message : "request failed"}]\n`);
+      }
+      if (!closed) {
+        closed = true;
+        try {
+          controller.close();
+        } catch {
+          /* already closed */
+        }
+      }
+    },
+  });
+  return new Response(stream);
+}
+
 export async function POST(req: Request) {
-  let body: { query?: string; cliId?: string };
+  let body: { query?: string; cliId?: string; engine?: string };
   try {
     body = await req.json();
   } catch {
@@ -139,26 +221,34 @@ export async function POST(req: Request) {
   }
   const query = (body.query || "").trim();
   const cliId = body.cliId;
-  if (!query || !cliId) return Response.json({ error: "query and cliId required" }, { status: 400 });
+  const engine = body.engine === "key" ? "key" : "cli";
+  if (!query || (engine === "cli" && !cliId))
+    return Response.json({ error: "query and cliId required" }, { status: 400 });
 
-  const resolved = resolveCli(cliId);
+  if (engine === "key") {
+    // Key-based engine (Config → "Paste an AI key"): same canonical mode +
+    // dedup context, streamed from the provider instead of a spawned CLI.
+    const cfg = readAiKeys(careerOpsRoot());
+    if (!cfg)
+      return Response.json(
+        {
+          code: "KEY_MISSING",
+          error: "No AI key configured — open Config, pick “Paste an AI key”, and save one.",
+        },
+        { status: 400 },
+      );
+    const built = buildDiscoverPrompt(query);
+    if (built.missing) return built.missing;
+    return keyEngineResponse(built.prompt!, cfg, req.signal);
+  }
+
+  const resolved = resolveCli(cliId!);
   if (!resolved) return Response.json({ error: `CLI '${cliId}' not found on this machine` }, { status: 404 });
   const { spec, binPath } = resolved;
 
-  // Read the CANONICAL mode at request time — single source of truth, never a
-  // homegrown prompt. Missing (older core) → graceful 400 so the Scan tab stays usable.
-  let mode: string;
-  try {
-    mode = fs.readFileSync(path.join(careerOpsRoot(), "modes", "discover.md"), "utf8");
-  } catch {
-    return Response.json({ code: "MODE_MISSING", error: "AI search needs a newer career-ops — update to enable it." }, { status: 400 });
-  }
-
-  const { lines } = assembleDedupContext();
-  const memory = readMemory();
-  const memoryLine = memory.trim() ? `\n\nWHAT YOU KNOW ABOUT THE USER (persistent memory):\n${memory.trim()}` : "";
-  const knownBlock = lines.length ? `\n\n--- ALREADY KNOWN (dedup — do NOT propose these) ---\n${lines.join("\n")}` : "";
-  const prompt = `${mode}${OUTPUT_CONTRACT}${memoryLine}${knownBlock}\n\n--- USER INTENT ---\n${query}\n`;
+  const built = buildDiscoverPrompt(query);
+  if (built.missing) return built.missing;
+  const prompt = built.prompt!;
 
   const isClaude = cliId === "claude";
   const isCodex = cliId === "codex";

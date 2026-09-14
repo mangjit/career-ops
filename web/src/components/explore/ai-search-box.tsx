@@ -77,7 +77,7 @@ export function AiSearchBox({
                 Reads the public web with <span className="text-foreground">{cliName || "your CLI"}</span> — it costs your tokens.
               </>
             ) : (
-              "Connect an AI CLI in Config to use AI search."
+              "Connect an AI CLI — or paste an AI key — in Config to use AI search."
             )}
           </span>
           <button

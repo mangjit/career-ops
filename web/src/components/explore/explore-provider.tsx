@@ -76,7 +76,7 @@ type ExploreCtx = {
   setMode: (m: ExploreMode) => void;
   aiIntent: string;
   setAiIntent: (s: string) => void;
-  discoverAI: () => Promise<void>;
+  discoverAI: (engineHint?: "key") => Promise<void>;
   aiTrace: AiTraceChunk[];
   aiCost: AiCost;
 };
@@ -405,17 +405,25 @@ export function ExploreProvider({ children }: { children: React.ReactNode }) {
   }, []);
 
   // AI search — orchestrate modes/discover.md via the user's CLI, streamed.
-  const discoverAI = useCallback(async () => {
+  const discoverAI = useCallback(async (engineHint?: "key") => {
     if (runningRef.current) return;
     const intent = aiIntentRef.current.trim();
     if (!intent) return;
     let cliId: string | null = null;
+    // The key engine (Config → "Paste an AI key") needs no local CLI — that's
+    // what makes AI search work on a deployed instance like Render.
+    let engine: "cli" | "key" = "cli";
     try {
-      cliId = JSON.parse(localStorage.getItem("career-ops:config") || "{}").cliId || null;
+      const cfg = JSON.parse(localStorage.getItem("career-ops:config") || "{}");
+      cliId = cfg.cliId || null;
+      if (cfg.mode === "key") engine = "key";
     } catch {
       cliId = null;
     }
-    if (!cliId) {
+    // The Explore view probes the server key store for fresh browsers; trust
+    // its hint over an empty localStorage.
+    if (engineHint === "key") engine = "key";
+    if (engine === "cli" && !cliId) {
       setPhase("blocked");
       return;
     }
@@ -466,7 +474,7 @@ export function ExploreProvider({ children }: { children: React.ReactNode }) {
       const r = await fetch("/api/explore/ai", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ query: intent, cliId }),
+        body: JSON.stringify(engine === "key" ? { query: intent, engine } : { query: intent, cliId }),
       });
       if (r.status === 404) {
         runningRef.current = false;

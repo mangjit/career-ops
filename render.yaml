@@ -1,0 +1,58 @@
+# Render Blueprint for the career-ops web dashboard (web/).
+#
+# Persistence: instead of a Render Disk, this deployment keeps the user's
+# file-first data (data/, reports/, config/, cv.md, …) in a MongoDB — e.g. a
+# free Atlas M0 cluster. web/src/lib/mongo-sync.mjs pulls the tracked files
+# from Mongo at boot and flushes changes back every ~30s, so the ephemeral
+# instance filesystem survives spin-downs and redeploys. This is what lets
+# the service run on Render's FREE plan (which supports no disks at all).
+#
+# NOTE before deploying:
+#   1. Replace CHANGE-ME with your actual service name/hostname in the two
+#      guard env vars below. The web app's /api surface serves loopback only
+#      unless CAREER_OPS_WEB_ALLOWED_HOSTS / CAREER_OPS_ALLOWED_ORIGINS opt a
+#      host in (see web/src/lib/origin-guard.mjs). The deploy itself no
+#      longer depends on them — the health check hits the unguarded
+#      /healthz — but until they match your hostname, the *browser* gets
+#      403s on every /api call (the UI looks dead).
+#   2. Paste your MongoDB connection string into the MONGODB_URI env var in
+#      the Render dashboard after creating the service (it's marked
+#      sync: false so it never lives in this file).
+#   3. Agent-driven features (AI scan/eval/tailor, PDF rendering) need CLIs
+#      and Chromium/LaTeX that Render's native Node runtime doesn't provide;
+#      switch this service to a Docker runtime if you need them.
+
+services:
+  - type: web
+    name: career-ops-web
+    runtime: node
+    rootDir: web
+    plan: free # free tier: 512 MB, spins down after 15 min idle (cold start on
+      # the next request). The MongoDB sync makes this safe — data survives both
+      # spin-downs and redeploys, and the SIGTERM flush captures shutdown writes.
+      # Keep exactly ONE instance: the sync is single-writer by design.
+    buildCommand: npm ci && npm run build
+    startCommand: npm run start
+    # /healthz lives OUTSIDE the /api origin guard, so the platform probe
+    # passes even before the allowlist vars below are set. (Never point the
+    # health check at an /api route — the guard 403s unknown hosts on
+    # purpose, and the deploy would "Timed Out" until they're configured.)
+    healthCheckPath: /healthz
+    envVars:
+      - key: NODE_VERSION
+        value: "22" # web/ requires Node >= 22
+      - key: CAREER_OPS_WEB_ALLOWED_HOSTS
+        value: CHANGE-ME.onrender.com
+      - key: CAREER_OPS_ALLOWED_ORIGINS
+        value: https://CHANGE-ME.onrender.com
+      - key: MONGODB_URI
+        sync: false # paste your MongoDB/Atlas connection string in the dashboard
+      # Optional tuning (defaults shown):
+      # - key: CAREER_OPS_MONGO_DB
+      #   value: career-ops
+      # - key: CAREER_OPS_MONGO_COLLECTION
+      #   value: files
+      # - key: CAREER_OPS_MONGO_SYNC_INTERVAL_MS
+      #   value: "30000"
+      # - key: CAREER_OPS_MONGO_PULL
+      #   value: seed # "always" force-overwrites local files with the cloud copy

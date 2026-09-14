@@ -13,6 +13,7 @@ import {
 import { cn } from "@/lib/cn";
 import { CadenceSettings } from "@/components/followups/cadence-settings";
 import { persistCliId, readSavedCliId } from "@/lib/saved-cli";
+import { AI_PROVIDERS, providerSpec } from "@/lib/ai-providers.mjs";
 
 type Cli = {
   id: string;
@@ -25,40 +26,51 @@ type Cli = {
 
 type Mode = "cli" | "key" | "manual";
 
-const PROVIDERS = [
-  { id: "anthropic", label: "Anthropic (Claude)" },
-  { id: "openai", label: "OpenAI" },
-  { id: "google", label: "Google (Gemini)" },
-  { id: "openrouter", label: "OpenRouter" },
-] as const;
-
 const STORAGE_KEY = "career-ops:config";
 
 export function ConfigForm() {
   const [mode, setMode] = useState<Mode>("cli");
   const [clis, setClis] = useState<Cli[] | null>(null);
   const [cliId, setCliId] = useState<string>("");
-  const [provider, setProvider] = useState("anthropic");
+  const [provider, setProvider] = useState("google");
+  const [model, setModel] = useState("");
+  const [baseUrl, setBaseUrl] = useState("");
   const [apiKey, setApiKey] = useState("");
+  const [keyOnServer, setKeyOnServer] = useState<null | { masked: string }>(null);
+  const [testing, setTesting] = useState(false);
+  const [testResult, setTestResult] = useState<null | { ok: boolean; text: string }>(null);
   const [logos, setLogos] = useState(true);
   const [saved, setSaved] = useState(false);
 
-  // Load saved prefs
+  // Load saved prefs + whether a key engine already lives on the server.
   useEffect(() => {
     try {
       const raw = localStorage.getItem(STORAGE_KEY);
       if (raw) {
         const v = JSON.parse(raw);
-        // key/manual are not wired yet (nothing reads them) → never restore into
-        // those dead panels; only the Installed-CLI path is functional.
-        if (v.mode === "cli") setMode("cli");
+        if (v.mode === "cli" || v.mode === "key") setMode(v.mode);
         if (v.cliId) setCliId(v.cliId);
         if (v.provider) setProvider(v.provider);
+        if (typeof v.model === "string") setModel(v.model);
+        if (typeof v.baseUrl === "string") setBaseUrl(v.baseUrl);
         if (typeof v.logos === "boolean") setLogos(v.logos);
       }
     } catch {
       /* ignore */
     }
+    fetch("/api/config/ai-keys")
+      .then((r) => r.json())
+      .then((d) => {
+        if (d?.configured) {
+          setKeyOnServer({ masked: d.maskedKey ?? "" });
+          if (d.provider) setProvider(d.provider);
+          setModel((m) => m || d.model || "");
+          setBaseUrl((b) => b || d.baseUrl || "");
+        }
+      })
+      .catch(() => {
+        /* server-side store unreachable — the panel still works */
+      });
   }, []);
 
   // Detect installed CLIs
@@ -82,12 +94,55 @@ export function ConfigForm() {
   }, []);
 
   function save() {
-    // The API key is deliberately NOT persisted: nothing reads it yet (the
-    // key/manual panel is unwired) and a secret must never sit in clear-text
-    // localStorage. Keys belong in the user's own CLI/provider config.
-    localStorage.setItem(STORAGE_KEY, JSON.stringify({ mode, cliId, provider, logos }));
+    // The API key NEVER touches localStorage — it goes to the server's
+    // gitignored, Mongo-synced config/ai-keys.json; the browser only keeps
+    // non-secret prefs (mode/provider/model/logos).
+    localStorage.setItem(STORAGE_KEY, JSON.stringify({ mode, cliId, provider, model, baseUrl, logos }));
+    const wantsServerSave =
+      mode === "key" && (apiKey.trim() || providerSpec(provider)?.optionalKey);
+    if (wantsServerSave) {
+      fetch("/api/config/ai-keys", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ provider, model: model || undefined, apiKey, baseUrl: baseUrl || undefined }),
+      })
+        .then((r) => r.json())
+        .then((d) => {
+          if (d?.configured) {
+            setApiKey("");
+            setKeyOnServer({ masked: "saved" });
+          }
+        })
+        .catch(() => {
+          /* the saved banner below still reflects local prefs */
+        });
+    }
     setSaved(true);
     setTimeout(() => setSaved(false), 2000);
+  }
+
+  function testKey() {
+    setTesting(true);
+    setTestResult(null);
+    fetch("/api/config/ai-keys/test", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(
+        apiKey.trim() || providerSpec(provider)?.optionalKey
+          ? { provider, model: model || undefined, apiKey, baseUrl: baseUrl || undefined }
+          : {},
+      ),
+    })
+      .then((r) => r.json())
+      .then((d) =>
+        setTestResult(
+          d?.ok
+            ? { ok: true, text: `${d.provider}/${d.model} replied: “${d.sample}”` }
+            : { ok: false, text: d?.error || "test failed" },
+        ),
+      )
+      .catch(() => setTestResult({ ok: false, text: "could not reach the server" }))
+      .finally(() => setTesting(false));
   }
 
   const installed = clis?.filter((c) => c.installed) ?? [];
@@ -116,8 +171,7 @@ export function ConfigForm() {
           onClick={() => setMode("key")}
           icon={KeyRound}
           title="Paste an AI key"
-          hint="Coming soon"
-          disabled
+          hint="Gemini · OpenRouter · Groq · NIM"
         />
         <ModeCard
           active={mode === "manual"}
@@ -225,11 +279,15 @@ export function ConfigForm() {
                 Provider
               </label>
               <div className="grid gap-2 sm:grid-cols-2">
-                {PROVIDERS.map((p) => (
+                {AI_PROVIDERS.map((p) => (
                   <button
                     key={p.id}
                     type="button"
-                    onClick={() => setProvider(p.id)}
+                    onClick={() => {
+                      setProvider(p.id);
+                      setModel("");
+                      setTestResult(null);
+                    }}
                     className={cn(
                       "rounded-xl border px-4 py-2.5 text-left text-sm transition-colors",
                       provider === p.id
@@ -241,22 +299,100 @@ export function ConfigForm() {
                   </button>
                 ))}
               </div>
+              {providerSpec(provider)?.keyUrl ? (
+                <p className="mt-2 text-xs text-faint">
+                  No key yet?{" "}
+                  <a
+                    href={providerSpec(provider)?.keyUrl ?? undefined}
+                    target="_blank"
+                    rel="noreferrer"
+                    className="inline-flex items-center gap-0.5 text-brand hover:underline"
+                  >
+                    Get one free <ExternalLink className="size-3" />
+                  </a>
+                </p>
+              ) : null}
+            </div>
+            {provider === "custom" && (
+              <div>
+                <label className="mb-1 block text-xs font-semibold uppercase tracking-[0.18em] text-muted">
+                  Base URL
+                </label>
+                <input
+                  type="text"
+                  value={baseUrl}
+                  onChange={(e) => setBaseUrl(e.target.value)}
+                  placeholder="http://localhost:11434/v1"
+                  autoComplete="off"
+                  className="w-full rounded-xl border border-border bg-surface/60 px-4 py-2.5 font-mono text-sm outline-none transition-colors placeholder:text-faint focus:border-brand/50"
+                />
+                <p className="mt-1 text-xs text-faint">
+                  Any OpenAI-compatible endpoint — Ollama, LM Studio, vLLM, llama.cpp server, your own
+                  gateway. A missing local model is auto-pulled when the server supports it (Ollama).
+                </p>
+              </div>
+            )}
+            <div>
+              <label className="mb-1 block text-xs font-semibold uppercase tracking-[0.18em] text-muted">
+                Model
+              </label>
+              <input
+                type="text"
+                value={model}
+                onChange={(e) => setModel(e.target.value)}
+                placeholder={
+                  provider === "custom"
+                    ? "e.g. llama3.1, qwen2.5-coder (required)"
+                    : (providerSpec(provider)?.defaultModel ?? "default")
+                }
+                autoComplete="off"
+                className="w-full rounded-xl border border-border bg-surface/60 px-4 py-2.5 font-mono text-sm outline-none transition-colors placeholder:text-faint focus:border-brand/50"
+              />
+              <p className="mt-1 text-xs text-faint">
+                Blank = <span className="text-muted">auto</span>: free-first model chain, switching
+                automatically when a model is rate-limited, gone or down
+                {providerSpec(provider)?.freeModels?.length
+                  ? ` (${providerSpec(provider)!.freeModels.join(" → ")})`
+                  : ""}
+                .
+              </p>
             </div>
             <div>
               <label className="mb-1 block text-xs font-semibold uppercase tracking-[0.18em] text-muted">
                 Paste an AI key
               </label>
-              <p className="mb-2 text-xs text-faint">Bring a key from OpenAI, Anthropic, and others.</p>
-              <input
-                type="password"
-                value={apiKey}
-                onChange={(e) => setApiKey(e.target.value)}
-                placeholder="sk-…"
-                autoComplete="off"
-                className="w-full rounded-xl border border-border bg-surface/60 px-4 py-2.5 font-mono text-sm outline-none transition-colors placeholder:text-faint focus:border-brand/50"
-              />
+              <p className="mb-2 text-xs text-faint">
+                {keyOnServer
+                  ? `A key is saved on the server (${keyOnServer.masked}) — paste a new one to replace it.`
+                  : "Bring a key from your provider; it powers AI search on any host, including a Render deploy."}
+              </p>
+              <div className="flex gap-2">
+                <input
+                  type="password"
+                  value={apiKey}
+                  onChange={(e) => setApiKey(e.target.value)}
+                  placeholder={providerSpec(provider)?.keyHint ?? "sk-…"}
+                  autoComplete="off"
+                  className="w-full rounded-xl border border-border bg-surface/60 px-4 py-2.5 font-mono text-sm outline-none transition-colors placeholder:text-faint focus:border-brand/50"
+                />
+                <button
+                  type="button"
+                  onClick={testKey}
+                  disabled={testing}
+                  className="shrink-0 rounded-xl border border-border bg-surface/50 px-4 py-2 text-sm text-muted transition-colors hover:bg-surface-hover hover:text-foreground disabled:opacity-60"
+                >
+                  {testing ? "Testing…" : "Test key"}
+                </button>
+              </div>
+              {testResult ? (
+                <p className={cn("mt-2 text-xs", testResult.ok ? "text-emerald-400" : "text-red-400")}>
+                  {testResult.text}
+                </p>
+              ) : null}
               <p className="mt-2 text-xs text-faint">
-                Stored only in this browser — never sent anywhere but your chosen provider.
+                Stored server-side in <span className="font-mono">config/ai-keys.json</span> — gitignored and
+                Mongo-synced, never in this browser. Gemini is grounded with live Google Search; the others
+                propose from model knowledge (candidates stay unverified until scanned).
               </p>
             </div>
           </div>

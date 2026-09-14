@@ -48,7 +48,7 @@ export function ExploreModeToggle({
         <span className="hidden sm:inline-flex">
           <CostBadge kind="spend" size="xs" />
         </span>
-        {!cliConfigured && <span className="text-[10px] text-faint">needs a CLI</span>}
+        {!cliConfigured && <span className="text-[10px] text-faint">needs a CLI or key</span>}
       </button>
     </div>
   );

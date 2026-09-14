@@ -110,12 +110,29 @@ export function JobsProvider({ children }: { children: React.ReactNode }) {
 
       (async () => {
         const cliId = readSavedCliId() || (await resolveCliId());
+        // The key engine (Config → "Paste an AI key") can evaluate with NO
+        // CLI on the host — consult the saved Config and the server store
+        // before declaring the run impossible.
+        let engine: "cli" | "key" | null = cliId ? "cli" : null;
         if (!cliId) {
+          try {
+            const saved = JSON.parse(localStorage.getItem("career-ops:config") || "{}");
+            if (saved.mode === "key") {
+              engine = "key";
+            } else {
+              const d = await fetch("/api/config/ai-keys").then((r) => r.json());
+              if (d?.configured) engine = "key";
+            }
+          } catch {
+            /* server store unreachable — stay CLI-only */
+          }
+        }
+        if (!cliId && engine !== "key") {
           patch(id, (j) => ({
             ...j,
             status: "error",
             endedAt: Date.now(),
-            steps: [...j.steps, { kind: "status", label: "No CLI configured — open Config and click Save config", ts: Date.now() }],
+            steps: [...j.steps, { kind: "status", label: "No CLI or AI key configured — open Config and save one", ts: Date.now() }],
           }));
           return;
         }
@@ -154,7 +171,11 @@ export function JobsProvider({ children }: { children: React.ReactNode }) {
           const res = await fetch("/api/run", {
             method: "POST",
             headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({ kind: opts.kind, input: opts.input, cliId }),
+              body: JSON.stringify(
+                engine === "key"
+                  ? { kind: opts.kind, input: opts.input, engine }
+                  : { kind: opts.kind, input: opts.input, cliId },
+              ),
           });
           if (!res.ok || !res.body) {
             const e = await res.json().catch(() => ({}));

@@ -52,6 +52,77 @@ Open http://localhost:3000. The app reads the career-ops checkout it lives in
 - **Additive:** the web is isolated from the core's packaging, CI and release
   automation. The CLI works exactly the same without it.
 
+## Deploying (e.g. Render) with MongoDB persistence
+
+The web app is local-first: it reads and writes the files in the checkout
+(`data/`, `reports/`, `config/`, `cv.md`, …). Those files are gitignored, so
+on an ephemeral host (Render re-wipes the instance filesystem on every
+redeploy) the app would boot empty and lose whatever it wrote. Instead of a
+mounted disk you can keep the durable copy in a **MongoDB** (a free Atlas M0
+cluster is enough): `src/lib/mongo-sync.mjs` pulls the tracked files from
+Mongo at boot (seeding the empty filesystem) and flushes changed files back
+every ~30 s, including a best-effort flush on SIGTERM.
+
+1. Deploy `web/` as a Node web service (on Render: Root Directory `web`,
+   build `npm ci && npm run build`, start `npm run start`, health check
+   `/api/version`; a ready-made blueprint lives in `render.yaml` at the repo
+   root).
+2. Set env vars:
+   - `MONGODB_URI` — your connection string (enables sync; unset = pure
+     local-first, no-op).
+   - `CAREER_OPS_WEB_ALLOWED_HOSTS` / `CAREER_OPS_ALLOWED_ORIGINS` — your
+     deploy hostname/origin, or the loopback-only API guard 403s everything
+     (see `src/lib/origin-guard.mjs`).
+   - Optional: `CAREER_OPS_MONGO_DB` (default `career-ops`),
+     `CAREER_OPS_MONGO_COLLECTION` (default `files`),
+     `CAREER_OPS_MONGO_SYNC_INTERVAL_MS` (default `30000`),
+     `CAREER_OPS_MONGO_PULL=always` (force-overwrite local files with the
+     cloud copy; default `seed` only writes into an empty checkout).
+3. First boot of an empty instance restores your data from Mongo; from then
+   on every change is pushed back within one sync interval. On Render's
+   **free** plan (512 MB, no disk support) the instance spins down after
+   ~15 min idle — the next request pays a cold start, then Mongo restores
+   your data at boot; nothing is lost.
+
+Guard rails: only the personal, gitignored surface is synced (never code or
+secrets); `.gitkeep`, `*.tmp-*` and `*.bak-*` scratch files stay out; files
+over 8 MB are skipped with a log line. Repo-owned scaffolding inside the
+tracked dirs (e.g. `writing-samples/README.md`) is never synced and never
+counts as "has data". Safety: seed mode never clobbers a checkout that
+already has data, and a skipped seed never deletes remote docs. Run a
+**single instance** — the sync is last-write-wins and two instances would
+race. Note also that agent-driven features (AI scan/eval/tailor, PDF
+rendering) need CLIs/Chromium/LaTeX the native Node runtime lacks; use a
+Docker deploy for those.
+
+**AI without a CLI (key engine):** deployed hosts have no agent CLIs, so the
+"Use an AI tool you have" engine can't work there. Config → **"Paste an AI
+key"** unlocks a key-based engine — Gemini (grounded with live Google
+Search), OpenRouter, Groq, NVIDIA NIM, OpenAI, plus **Custom / local** (any
+OpenAI-compatible base URL: Ollama, LM Studio, vLLM, your own gateway; key
+optional; a missing local model is auto-pulled Ollama-style when supported).
+Model blank = **auto**: a free-first model chain per provider with
+**automatic switching** on rate-limits/outages (hops are narrated into the
+live trace; a stream is never swapped mid-sentence). Stored server-side in
+`config/ai-keys.json` (gitignored, Mongo-synced; the browser never keeps the
+key). It powers AI search (`/api/explore/ai` streams the provider through the
+same `<<offer:>>` grammar the CLI produces), and **Evaluate** on job pages
+(`/api/run` spawns the core's own key runner, `openrouter-runner.mjs`, with
+the stored key — OpenAI-wire generic, Gemini via its official OpenAI-compat
+bridge). A "Test key" button verifies credentials before saving. CV
+tailor/PDF and portal fixes remain agentic and still need a CLI on the host.
+
+**Troubleshooting:** the platform health check uses `/healthz`, which lives
+outside the `/api` origin guard, so deploys pass even with zero config. If
+the *browser* 403s on every action instead, the guard is doing its job: set
+`CAREER_OPS_WEB_ALLOWED_HOSTS` and `CAREER_OPS_ALLOWED_ORIGINS` to your
+actual deploy hostname/origin. (Historically the health check pointed at
+`/api/version` and fresh deploys "Timed Out" until those vars existed —
+never wire a host's probe into a guarded route.) If the logs show
+`mongo-sync: pull skipped — checkout not empty`, you're on a pre-`058682b`
+build (fresh clones' scaffolding used to block the seed pull) or your
+checkout genuinely has data; `CAREER_OPS_MONGO_PULL=always` force-restores.
+
 ## Development
 
 ```bash

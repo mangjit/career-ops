@@ -48,6 +48,28 @@ export function ExplorerView({
   const [refineOpen, setRefineOpen] = useState(false);
   const [cli, setCli] = useState<{ id: string | null; name?: string }>({ id: null });
   const [firstRun, setFirstRun] = useState(false);
+  // The key engine (Config → "Paste an AI key") makes AI search available
+  // with NO CLI — that's the whole point on a Render deploy. localStorage
+  // mirrors the last Config save; the server store covers fresh browsers.
+  const [keyConfigured, setKeyConfigured] = useState(false);
+
+  useEffect(() => {
+    try {
+      if (JSON.parse(localStorage.getItem("career-ops:config") || "{}").mode === "key") {
+        setKeyConfigured(true);
+        return;
+      }
+    } catch {
+      /* fall through to the server probe */
+    }
+    fetch("/api/config/ai-keys")
+      .then((r) => r.json())
+      .then((d) => setKeyConfigured(!!d?.configured))
+      .catch(() => setKeyConfigured(false));
+  }, []);
+
+  const aiAvailable = !!cli.id || keyConfigured;
+  const aiEngineName = cli.name ?? (keyConfigured ? "your key-based AI" : undefined);
 
   useEffect(() => {
     try {
@@ -106,7 +128,7 @@ export function ExplorerView({
   );
 
   const isAi = mode === "ai";
-  if (running) return isAi ? <AiHuntView cliName={cli.name} /> : <DiscoveringState />;
+  if (running) return isAi ? <AiHuntView cliName={aiEngineName} /> : <DiscoveringState />;
 
   const canDiscover = filters.ats.length > 0;
   const isResults = phase === "results";
@@ -121,7 +143,7 @@ export function ExplorerView({
             <span className="rounded-full border border-brand/30 bg-brand-soft px-2 py-0.5 text-[10px] font-bold uppercase tracking-wide text-brand-text">New</span>
           </div>
           <div className="w-full sm:ml-auto sm:w-auto">
-            <ExploreModeToggle mode={mode} onChange={setMode} cliConfigured={!!cli.id} />
+            <ExploreModeToggle mode={mode} onChange={setMode} cliConfigured={aiAvailable} />
           </div>
         </div>
         {!isResults && (
@@ -147,9 +169,9 @@ export function ExplorerView({
             <AiSearchBox
               intent={aiIntent}
               onIntent={setAiIntent}
-              onSubmit={() => void discoverAI()}
-              cliConfigured={!!cli.id}
-              cliName={cli.name}
+              onSubmit={() => void discoverAI(keyConfigured ? "key" : undefined)}
+              cliConfigured={aiAvailable}
+              cliName={aiEngineName}
               onRunScan={() => setMode("scan")}
             />
             {phase === "results" && <ResultsList offers={enriched} />}
@@ -388,9 +410,10 @@ function BlockedCard() {
       <div className="mx-auto grid size-12 place-items-center rounded-full bg-brand-soft text-brand">
         <Sparkles className="size-6" />
       </div>
-      <h2 className={`${instrumentSerif.className} mt-4 text-2xl text-foreground`}>AI search needs a CLI</h2>
+      <h2 className={`${instrumentSerif.className} mt-4 text-2xl text-foreground`}>AI search needs an engine</h2>
       <p className="mx-auto mt-1.5 max-w-md text-sm text-muted">
-        Connect Claude Code, Gemini, or any agent CLI — your key, your tokens, your machine. The free Scan stays available without one.
+        Connect Claude Code or any agent CLI — or paste an AI key (Gemini, OpenRouter, Groq, NVIDIA NIM,
+        custom endpoint): your key, your tokens. The free Scan stays available without either.
       </p>
       <Link href="/config" className="mt-4 inline-flex items-center gap-1.5 rounded-lg bg-brand px-3.5 py-2 text-sm font-semibold text-brand-foreground transition hover:brightness-110">
         <Settings className="size-4" /> Open Config

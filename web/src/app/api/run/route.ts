@@ -9,6 +9,8 @@ import { resolveCli } from "@/lib/clis";
 import { accumulateTokens, hasNewCompletedReport, isFatalGenericStderr, killMsForKind, timeoutMessage } from "@/lib/run-cli-support.mjs";
 import { spawnHeadlessCli } from "@/lib/spawn-cli.mjs";
 import { careerOpsRoot, readMemory, findReportFile, readInbox, readScanDates, readLanguageConfig } from "@/lib/career-ops";
+import { readAiKeys } from "@/lib/ai-key-store.mjs";
+import { buildKeyRunner } from "@/lib/key-runner.mjs";
 import { resolvePdfPaths, type PdfPaths } from "@/lib/pdf-paths.mjs";
 import { renderAndMarkPdf, writeCvHtml, pdfRunOutcome } from "@/lib/pdf-render.mjs";
 import { createCvEnvelopeFilter, type CvEnvelope } from "@/lib/cv-envelope.mjs";
@@ -21,24 +23,69 @@ export const dynamic = "force-dynamic";
 export const maxDuration = 800; // a real oferta evaluation / pdf-mode CV tailoring + render is heavy and multi-step
 
 export async function POST(req: Request) {
-  let body: { kind?: string; input?: string; cliId?: string };
+  let body: { kind?: string; input?: string; cliId?: string; engine?: string };
   try {
     body = await req.json();
   } catch {
     return new Response(JSON.stringify({ error: "bad json" }), { status: 400 });
   }
   const { kind = "evaluate", input, cliId } = body;
-  if (!input || !cliId) {
+  const engine = body.engine === "key" ? "key" : "cli";
+  if (!input || (engine === "cli" && !cliId)) {
     return new Response(JSON.stringify({ error: "input and cliId required" }), { status: 400 });
   }
-  const resolved = resolveCli(cliId);
-  if (!resolved) {
-    return new Response(JSON.stringify({ error: `CLI '${cliId}' not found` }), {
-      status: 404,
-      headers: { "Content-Type": "application/json" },
-    });
+
+  // Key engine: no agent CLI on this host — delegate to the core's own
+  // key-based runner (openrouter-runner.mjs), which is OpenAI-wire generic.
+  // `any` on purpose: the key branch synthesizes a minimal spec (just a name
+  // for stream labels) while the CLI branch carries the full CliSpec shape
+  // (parseEvent, stderrIsFatal, …) the stream handler below consumes.
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  let spec: any;
+  let binPath: string;
+  let childEnv: NodeJS.ProcessEnv = process.env;
+  let keyRun: ReturnType<typeof buildKeyRunner> | null = null;
+  if (engine === "key") {
+    if (kind !== "evaluate") {
+      return new Response(
+        JSON.stringify({
+          error: "The key engine covers evaluation + AI search; CV tailor/PDF and portal fixes still need an agent CLI.",
+        }),
+        { status: 400, headers: { "Content-Type": "application/json" } },
+      );
+    }
+    const cfg = readAiKeys(careerOpsRoot());
+    if (!cfg) {
+      return new Response(
+        JSON.stringify({
+          code: "KEY_MISSING",
+          error: "No AI key configured — open Config, pick “Paste an AI key”, and save one.",
+        }),
+        { status: 400, headers: { "Content-Type": "application/json" } },
+      );
+    }
+    try {
+      keyRun = buildKeyRunner({ cfg, root: careerOpsRoot(), input, execPath: process.execPath });
+    } catch (e) {
+      return new Response(JSON.stringify({ error: e instanceof Error ? e.message : "bad key config" }), {
+        status: 400,
+        headers: { "Content-Type": "application/json" },
+      });
+    }
+    spec = { name: keyRun.name };
+    binPath = keyRun.binPath;
+    childEnv = { ...process.env, ...keyRun.env };
+  } else {
+    const resolved = resolveCli(cliId!);
+    if (!resolved) {
+      return new Response(JSON.stringify({ error: `CLI '${cliId}' not found` }), {
+        status: 404,
+        headers: { "Content-Type": "application/json" },
+      });
+    }
+    spec = resolved.spec;
+    binPath = resolved.binPath;
   }
-  const { spec, binPath } = resolved;
 
   // These run the REAL core (modes/scripts), not just data — fail clearly if the
   // root is incomplete instead of faking it.
@@ -127,7 +174,11 @@ export async function POST(req: Request) {
   // A CLI with its own structured stream gets the argv that turns it on, so its
   // stdout matches spec.parseEvent below; spec.args stays the plain-text argv the
   // envelope-parsing routes rely on.
-  const args = isClaude ? claudeCliArgs({ kind, prompt }) : (spec.streamArgs ?? spec.args)(prompt);
+  const args = keyRun
+    ? keyRun.args
+    : isClaude
+      ? claudeCliArgs({ kind, prompt })
+      : (spec.streamArgs ?? spec.args!)(prompt);
 
   // For write-needing kinds, snapshot reports/ so we can verify the worker
   // actually persisted (non-Claude CLIs lack Write auth and silently no-op).
@@ -156,7 +207,7 @@ export async function POST(req: Request) {
   // every CLI-invoking route (assistant, explore/ai, cv/ingest, the apply planners),
   // which had the identical bug, and puts it behind one tested helper so it cannot
   // drift back in on any single call site.
-  const child = spawnHeadlessCli(binPath, args, { cwd: careerOpsRoot(), env: process.env });
+  const child = spawnHeadlessCli(binPath, args, { cwd: careerOpsRoot(), env: childEnv });
   // Decode once on the stream, not per chunk. Buffer#toString() decodes each chunk
   // independently, so a chunk boundary falling inside a multi-byte UTF-8 sequence
   // yields a replacement character and mis-decodes the bytes after it. Those bytes
