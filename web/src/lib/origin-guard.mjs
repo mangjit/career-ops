@@ -99,6 +99,38 @@ export function parseAllowedHosts(envValue) {
   return out;
 }
 
+/**
+ * The host a platform assigned to this very service (Render exports its own
+ * public URL as RENDER_EXTERNAL_URL). Trusting it is trusting the operator's
+ * own deployment, not a stranger — it makes Render deploys zero-config even
+ * when the minted hostname changes between service recreations.
+ */
+export function hostFromExternalUrl(url) {
+  if (!url) return "";
+  try {
+    return normalizeHost(new URL(url).host);
+  } catch {
+    return "";
+  }
+}
+
+/**
+ * Exact hosts, or "*.suffix" wildcards matching any (non-empty) subdomain —
+ * "*.onrender.com" answers for fresh minted hostnames without listing each.
+ * The bare suffix domain itself does NOT match its own wildcard.
+ */
+export function matchesAllowedHost(host, patterns) {
+  for (const p of patterns) {
+    if (p.startsWith("*.")) {
+      const suffix = p.slice(1); // ".onrender.com"
+      if (host.length > suffix.length && host.endsWith(suffix)) return true;
+    } else if (host === p) {
+      return true;
+    }
+  }
+  return false;
+}
+
 function block(reason) {
   return { ok: false, status: 403, reason };
 }
@@ -114,10 +146,12 @@ function block(reason) {
  * @returns {{ok: true} | {ok: false, status: number, reason: string}}
  */
 export function checkRequest({ secFetchSite, origin, host, allowedHosts, allowedOrigins }) {
-  // Host layer (F2): must be loopback, or an explicitly opted-in host.
+  // Host layer (F2): must be loopback, or an explicitly opted-in host
+  // (exact or *.wildcard — see matchesAllowedHost).
   const normalizedHost = normalizeHost(host);
   if (!normalizedHost) return block("missing Host header");
-  const hostAllowed = isLoopbackHost(normalizedHost) || (allowedHosts && allowedHosts.has(normalizedHost));
+  const hostAllowed =
+    isLoopbackHost(normalizedHost) || (allowedHosts && matchesAllowedHost(normalizedHost, allowedHosts));
   if (!hostAllowed) {
     return block(
       "this host is not allowed; the dashboard serves loopback only unless CAREER_OPS_WEB_ALLOWED_HOSTS opts it in",

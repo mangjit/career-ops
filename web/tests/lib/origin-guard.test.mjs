@@ -7,6 +7,8 @@ import {
   parseAllowedOrigins,
   normalizeOrigin,
   checkRequest,
+  matchesAllowedHost,
+  hostFromExternalUrl,
 } from "../../src/lib/origin-guard.mjs";
 
 // --- normalizeHost --------------------------------------------------------
@@ -301,4 +303,53 @@ test("the guard still works with no allowedOrigins passed at all", () => {
     allowedHosts: parseAllowedHosts(""),
   });
   assert.equal(d.ok, true);
+});
+
+// --- wildcard hosts + platform-assigned hosts ------------------------------
+
+test("matchesAllowedHost: exact entries, and *. wildcards for subdomains only", () => {
+  const set = new Set(["career-ops.example.com", "*.onrender.com"]);
+  assert.ok(matchesAllowedHost("career-ops.example.com", set));
+  assert.ok(matchesAllowedHost("career-ops-web.onrender.com", set));
+  assert.ok(matchesAllowedHost("fresh-mint-1234.onrender.com", set));
+  // the bare domain is NOT its own wildcard…
+  assert.ok(!matchesAllowedHost("onrender.com", set));
+  // …and unrelated hosts still fail
+  assert.ok(!matchesAllowedHost("evil.com", set));
+  assert.ok(!matchesAllowedHost("onrender.com.evil.com", set));
+});
+
+test("hostFromExternalUrl: the platform's own URL becomes a trusted host", () => {
+  assert.equal(hostFromExternalUrl("https://career-ops-web.onrender.com"), "career-ops-web.onrender.com");
+  assert.equal(hostFromExternalUrl("https://x-y.onrender.com:443"), "x-y.onrender.com");
+  assert.equal(hostFromExternalUrl(""), "");
+  assert.equal(hostFromExternalUrl("not a url"), "");
+});
+
+test("checkRequest: a Render-minted host passes same-origin browser traffic", () => {
+  const ok = checkRequest({
+    secFetchSite: "same-origin",
+    origin: "https://career-ops-web.onrender.com",
+    host: "career-ops-web.onrender.com",
+    allowedHosts: new Set([hostFromExternalUrl("https://career-ops-web.onrender.com")]),
+  });
+  assert.deepEqual(ok, { ok: true });
+  // but a DIFFERENT public host is still refused — auto-trust is per-service
+  const other = checkRequest({
+    secFetchSite: "same-origin",
+    origin: "https://someone-else.onrender.com",
+    host: "someone-else.onrender.com",
+    allowedHosts: new Set([hostFromExternalUrl("https://career-ops-web.onrender.com")]),
+  });
+  assert.equal(other.ok, false);
+});
+
+test("checkRequest: a wildcard allowlist answers any fresh minted hostname", () => {
+  const d = checkRequest({
+    secFetchSite: "same-origin",
+    origin: "https://brand-new-mint.onrender.com",
+    host: "brand-new-mint.onrender.com",
+    allowedHosts: parseAllowedHosts("*.onrender.com"),
+  });
+  assert.deepEqual(d, { ok: true });
 });

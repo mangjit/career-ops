@@ -112,13 +112,17 @@ the stored key — OpenAI-wire generic, Gemini via its official OpenAI-compat
 bridge). A "Test key" button verifies credentials before saving. CV
 tailor/PDF and portal fixes remain agentic and still need a CLI on the host.
 
-**Troubleshooting:** the platform health check uses `/healthz`, which lives
-outside the `/api` origin guard, so deploys pass even with zero config. If
-the *browser* 403s on every action instead, the guard is doing its job: set
-`CAREER_OPS_WEB_ALLOWED_HOSTS` and `CAREER_OPS_ALLOWED_ORIGINS` to your
-actual deploy hostname/origin. (Historically the health check pointed at
-`/api/version` and fresh deploys "Timed Out" until those vars existed —
-never wire a host's probe into a guarded route.) If the logs show
+**Troubleshooting:** on Render the whole deploy is zero-config: the health
+check uses the unguarded `/healthz`, and the `/api` guard auto-trusts the
+service's own host (Render exports `RENDER_EXTERNAL_URL`), while browsers pass
+the origin layer via same-origin Fetch Metadata — no env vars needed, ever,
+even when a recreated service mints a new hostname. `CAREER_OPS_WEB_ALLOWED_HOSTS`
+(accepts `*.wildcard`) is only for EXTRA hosts, `CAREER_OPS_ALLOWED_ORIGINS`
+only for exotic clients like browser extensions. If a non-Render public
+deploy 403s the browser, add its host to `CAREER_OPS_WEB_ALLOWED_HOSTS`.
+(Historically the health check pointed at `/api/version` and fresh deploys
+"Timed Out" until allowlist vars existed — never wire a host's probe into a
+guarded route.) If the logs show
 `mongo-sync: pull skipped — checkout not empty`, you're on a pre-`058682b`
 build (fresh clones' scaffolding used to block the seed pull) or your
 checkout genuinely has data; `CAREER_OPS_MONGO_PULL=always` force-restores.

@@ -8,13 +8,13 @@
 # the service run on Render's FREE plan (which supports no disks at all).
 #
 # NOTE before deploying:
-#   1. Replace CHANGE-ME with your actual service name/hostname in the two
-#      guard env vars below. The web app's /api surface serves loopback only
-#      unless CAREER_OPS_WEB_ALLOWED_HOSTS / CAREER_OPS_ALLOWED_ORIGINS opt a
-#      host in (see web/src/lib/origin-guard.mjs). The deploy itself no
-#      longer depends on them — the health check hits the unguarded
-#      /healthz — but until they match your hostname, the *browser* gets
-#      403s on every /api call (the UI looks dead).
+#   1. NO host/origin env vars are needed anymore. The guard auto-trusts the
+#      service's own platform-assigned host (Render exports RENDER_EXTERNAL_URL
+#      into every service), and browsers pass the origin layer via same-origin
+#      Fetch Metadata. Set CAREER_OPS_WEB_ALLOWED_HOSTS only to add EXTRA hosts
+#      (wildcards like *.onrender.com work); CAREER_OPS_ALLOWED_ORIGINS only
+#      for exotic clients such as a browser extension. If you had CHANGE-ME
+#      values from an older blueprint, you can delete them.
 #   2. Paste your MongoDB connection string into the MONGODB_URI env var in
 #      the Render dashboard after creating the service (it's marked
 #      sync: false so it never lives in this file).
@@ -41,10 +41,11 @@ services:
     envVars:
       - key: NODE_VERSION
         value: "22" # web/ requires Node >= 22
-      - key: CAREER_OPS_WEB_ALLOWED_HOSTS
-        value: CHANGE-ME.onrender.com
-      - key: CAREER_OPS_ALLOWED_ORIGINS
-        value: https://CHANGE-ME.onrender.com
+      # Optional extras — the service's own Render hostname is auto-trusted:
+      # - key: CAREER_OPS_WEB_ALLOWED_HOSTS
+      #   value: "*.onrender.com"
+      # - key: CAREER_OPS_ALLOWED_ORIGINS
+      #   value: chrome-extension://YOUR-EXT-ID
       - key: MONGODB_URI
         sync: false # paste your MongoDB/Atlas connection string in the dashboard
       # Optional tuning (defaults shown):
